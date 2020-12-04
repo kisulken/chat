@@ -105,6 +105,12 @@
 	},
 
 	"push": [
+	    {
+            "name":"expo",
+            "config": {
+                "enabled": $EXPO_PUSH_ENABLED
+            }
+        },
 		{
 			"name":"tnpg",
 			"config": {

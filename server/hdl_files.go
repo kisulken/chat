@@ -13,11 +13,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/tinode/chat/server/logs"
 	"github.com/tinode/chat/server/store"
 	"github.com/tinode/chat/server/store/types"
 )
@@ -34,7 +34,7 @@ func largeFileServe(wrt http.ResponseWriter, req *http.Request) {
 		wrt.WriteHeader(msg.Ctrl.Code)
 		enc.Encode(msg)
 		if err != nil {
-			log.Println("media serve", err)
+			logs.Warn.Println("media serve", err)
 		}
 	}
 
@@ -67,7 +67,7 @@ func largeFileServe(wrt http.ResponseWriter, req *http.Request) {
 		wrt.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		wrt.WriteHeader(http.StatusTemporaryRedirect)
 		enc.Encode(InfoFound("", "", now))
-		log.Println("media serve redirected", redirTo)
+		logs.Info.Println("media serve redirected", redirTo)
 		return
 	} else if err != nil {
 		writeHttpResponse(decodeStoreError(err, "", "", now, nil), err)
@@ -86,13 +86,12 @@ func largeFileServe(wrt http.ResponseWriter, req *http.Request) {
 	wrt.Header().Set("Content-Disposition", "attachment")
 	http.ServeContent(wrt, req, "", fd.UpdatedAt, rsc)
 
-	log.Println("media served OK")
+	logs.Info.Println("media served OK")
 }
 
-// largeFileUpload receives files from client over HTTP(S) and saves them to local file
-// system.
-func largeFileUpload(wrt http.ResponseWriter, req *http.Request) {
-	log.Println("Upload request", req.RequestURI)
+// largeFileReceive receives files from client over HTTP(S) and passes them to the configured media handler.
+func largeFileReceive(wrt http.ResponseWriter, req *http.Request) {
+	logs.Info.Println("Upload request", req.RequestURI)
 
 	now := types.TimeNow()
 	enc := json.NewEncoder(wrt)
@@ -105,7 +104,7 @@ func largeFileUpload(wrt http.ResponseWriter, req *http.Request) {
 		wrt.WriteHeader(msg.Ctrl.Code)
 		enc.Encode(msg)
 
-		log.Println("media upload:", msg.Ctrl.Code, msg.Ctrl.Text, "/", err)
+		logs.Info.Println("media upload:", msg.Ctrl.Code, msg.Ctrl.Text, "/", err)
 	}
 
 	// Check if this is a POST or a PUT request.
@@ -149,7 +148,7 @@ func largeFileUpload(wrt http.ResponseWriter, req *http.Request) {
 		wrt.WriteHeader(http.StatusTemporaryRedirect)
 		enc.Encode(InfoFound("", "", now))
 
-		log.Println("media upload redirected", redirTo)
+		logs.Info.Println("media upload redirected", redirTo)
 		return
 	} else if err != nil {
 		writeHttpResponse(decodeStoreError(err, "", "", now, nil), err)
@@ -200,7 +199,7 @@ func largeFileRunGarbageCollection(period time.Duration, block int) chan<- bool 
 			select {
 			case <-gcTimer:
 				if err := store.Files.DeleteUnused(time.Now().Add(-time.Hour), block); err != nil {
-					log.Println("media gc:", err)
+					logs.Warn.Println("media gc:", err)
 				}
 			case <-stop:
 				return

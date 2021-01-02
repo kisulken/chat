@@ -13,15 +13,16 @@ import (
 	"container/list"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/tinode/chat/pbx"
 	"github.com/tinode/chat/server/auth"
+	"github.com/tinode/chat/server/logs"
 	"github.com/tinode/chat/server/store"
 	"github.com/tinode/chat/server/store/types"
 
@@ -114,7 +115,7 @@ type Session struct {
 	lastTouched time.Time
 
 	// Time when the session received any packer from client
-	lastAction time.Time
+	lastAction int64
 
 	// Background session: subscription presence notifications and online status are delayed.
 	background bool
@@ -129,7 +130,10 @@ type Session struct {
 	// Indicates that the session is terminating.
 	// After this flag's been flipped to true, there must not be any more writes
 	// into the session's send channel.
-	terminating bool
+	// Read/written atomically.
+	// 0 = false
+	// 1 = true
+	terminating int32
 
 	// Outbound mesages, buffered.
 	// The content must be serialized in format suitable for the session.
@@ -258,9 +262,13 @@ func (s *Session) isCluster() bool {
 // queueOut attempts to send a ServerComMessage to a session write loop; if the send buffer is full,
 // timeout is `sendTimeout`.
 func (s *Session) queueOut(msg *ServerComMessage) bool {
-	if s.terminating {
+	if s == nil {
 		return true
 	}
+	if atomic.LoadInt32(&s.terminating) > 0 {
+		return true
+	}
+
 	if s.multi != nil {
 		// In case of a cluster we need to pass a copy of the actual session.
 		msg.sess = s
@@ -276,7 +284,7 @@ func (s *Session) queueOut(msg *ServerComMessage) bool {
 		if 200 <= msg.Ctrl.Code && msg.Ctrl.Code < 600 {
 			statsInc(fmt.Sprintf("CtrlCodesTotal%dxx", msg.Ctrl.Code/100), 1)
 		} else {
-			log.Println("Invalid response code: ", msg.Ctrl.Code)
+			logs.Warn.Println("Invalid response code: ", msg.Ctrl.Code)
 		}
 	}
 
@@ -288,7 +296,7 @@ func (s *Session) queueOut(msg *ServerComMessage) bool {
 	case s.send <- data:
 	default:
 		// Never block here since it may also block the topic's run() goroutine.
-		log.Println("s.queueOut: session's send queue full", s.sid)
+		logs.Err.Println("s.queueOut: session's send queue full", s.sid)
 		return false
 	}
 	return true
@@ -297,21 +305,21 @@ func (s *Session) queueOut(msg *ServerComMessage) bool {
 // queueOutBytes attempts to send a ServerComMessage already serialized to []byte.
 // If the send buffer is full, timeout is `sendTimeout`.
 func (s *Session) queueOutBytes(data []byte) bool {
-	if s == nil || s.terminating {
+	if s == nil || atomic.LoadInt32(&s.terminating) > 0 {
 		return true
 	}
 
 	select {
 	case s.send <- data:
 	default:
-		log.Println("s.queueOutBytes: session's send queue full", s.sid)
+		logs.Err.Println("s.queueOutBytes: session's send queue full", s.sid)
 		return false
 	}
 	return true
 }
 
 func (s *Session) detachSession(fromTopic string) {
-	if !s.terminating {
+	if atomic.LoadInt32(&s.terminating) == 0 {
 		s.detach <- fromTopic
 	}
 }
@@ -320,21 +328,21 @@ func (s *Session) stopSession(data interface{}) {
 	s.stop <- data
 }
 
-func (sess *Session) purgeChannels() {
-	for len(sess.send) > 0 {
-		<-sess.send
+func (s *Session) purgeChannels() {
+	for len(s.send) > 0 {
+		<-s.send
 	}
-	for len(sess.stop) > 0 {
-		<-sess.stop
+	for len(s.stop) > 0 {
+		<-s.stop
 	}
-	for len(sess.detach) > 0 {
-		<-sess.detach
+	for len(s.detach) > 0 {
+		<-s.detach
 	}
 }
 
 // cleanUp is called when the session is terminated to perform resource cleanup.
 func (s *Session) cleanUp(expired bool) {
-	s.terminating = true
+	atomic.StoreInt32(&s.terminating, 1)
 	s.purgeChannels()
 	s.inflightReqs.Wait()
 	if !expired {
@@ -355,8 +363,8 @@ func (s *Session) dispatchRaw(raw []byte) {
 	now := types.TimeNow()
 	var msg ClientComMessage
 
-	if s.terminating {
-		log.Println("s.dispatch: message received on a terminating session", s.sid)
+	if atomic.LoadInt32(&s.terminating) > 0 {
+		logs.Warn.Println("s.dispatch: message received on a terminating session", s.sid)
 		s.queueOut(ErrLocked("", "", now))
 		return
 	}
@@ -373,11 +381,11 @@ func (s *Session) dispatchRaw(raw []byte) {
 		toLog = raw[:512]
 		truncated = "<...>"
 	}
-	log.Printf("in: '%s%s' sid='%s' uid='%s'", toLog, truncated, s.sid, s.uid)
+	logs.Info.Printf("in: '%s%s' sid='%s' uid='%s'", toLog, truncated, s.sid, s.uid)
 
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		// Malformed message
-		log.Println("s.dispatch", err, s.sid)
+		logs.Warn.Println("s.dispatch", err, s.sid)
 		s.queueOut(ErrMalformed("", "", now))
 		return
 	}
@@ -386,8 +394,9 @@ func (s *Session) dispatchRaw(raw []byte) {
 }
 
 func (s *Session) dispatch(msg *ClientComMessage) {
-	s.lastAction = types.TimeNow()
-	msg.Timestamp = s.lastAction
+	now := types.TimeNow()
+	atomic.StoreInt64(&s.lastAction, now.UnixNano())
+	msg.Timestamp = now
 
 	if msg.AsUser == "" {
 		msg.AsUser = s.uid.UserId()
@@ -395,12 +404,15 @@ func (s *Session) dispatch(msg *ClientComMessage) {
 	} else if s.authLvl != auth.LevelRoot {
 		// Only root user can set non-default msg.from && msg.authLvl values.
 		s.queueOut(ErrPermissionDenied("", "", msg.Timestamp))
-		log.Println("s.dispatch: non-root asigned msg.from", s.sid)
+		logs.Warn.Println("s.dispatch: non-root asigned msg.from", s.sid)
 		return
 	} else if fromUid := types.ParseUserId(msg.AsUser); fromUid.IsZero() {
 		s.queueOut(ErrMalformed("", "", msg.Timestamp))
-		log.Println("s.dispatch: malformed msg.from: ", msg.AsUser, s.sid)
+		logs.Warn.Println("s.dispatch: malformed msg.from: ", msg.AsUser, s.sid)
 		return
+	} else if auth.Level(msg.AuthLvl) == auth.LevelNone {
+		// AuthLvl is not set by caller, assign default LevelAuth.
+		msg.AuthLvl = int(auth.LevelAuth)
 	}
 
 	var resp *ServerComMessage
@@ -420,7 +432,7 @@ func (s *Session) dispatch(msg *ClientComMessage) {
 	checkVers := func(m *ClientComMessage, handler func(*ClientComMessage)) func(*ClientComMessage) {
 		return func(m *ClientComMessage) {
 			if s.ver == 0 {
-				log.Println("s.dispatch: {hi} is missing", s.sid)
+				logs.Warn.Println("s.dispatch: {hi} is missing", s.sid)
 				s.queueOut(ErrCommandOutOfSequence(m.Id, m.Original, msg.Timestamp))
 				return
 			}
@@ -432,7 +444,7 @@ func (s *Session) dispatch(msg *ClientComMessage) {
 	checkUser := func(m *ClientComMessage, handler func(*ClientComMessage)) func(*ClientComMessage) {
 		return func(m *ClientComMessage) {
 			if msg.AsUser == "" {
-				log.Println("s.dispatch: authentication required", s.sid)
+				logs.Warn.Println("s.dispatch: authentication required", s.sid)
 				s.queueOut(ErrAuthRequiredReply(m, m.Timestamp))
 				return
 			}
@@ -495,7 +507,7 @@ func (s *Session) dispatch(msg *ClientComMessage) {
 	default:
 		// Unknown message
 		s.queueOut(ErrMalformed("", "", msg.Timestamp))
-		log.Println("s.dispatch: unknown message", s.sid)
+		logs.Warn.Println("s.dispatch: unknown message", s.sid)
 		return
 	}
 
@@ -545,7 +557,7 @@ func (s *Session) subscribe(msg *ClientComMessage) {
 			// Reply with a 500 to the user.
 			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
 			s.inflightReqs.Done()
-			log.Println("s.subscribe: join queue full, topic ", msg.RcptTo, s.sid)
+			logs.Err.Println("s.subscribe: hub.join queue full, topic ", msg.RcptTo, s.sid)
 		}
 		// Hub will send Ctrl success/failure packets back to session
 	}
@@ -580,7 +592,7 @@ func (s *Session) leave(msg *ClientComMessage) {
 	} else {
 		// Session wants to unsubscribe from the topic it did not join
 		// FIXME(gene): allow topic to unsubscribe without joining first; send to hub to unsub
-		log.Println("s.leave:", "must attach first", s.sid)
+		logs.Warn.Println("s.leave:", "must attach first", s.sid)
 		s.queueOut(ErrAttachFirst(msg, msg.Timestamp))
 	}
 }
@@ -626,14 +638,26 @@ func (s *Session) publish(msg *ClientComMessage) {
 	}
 	if sub := s.getSub(msg.RcptTo); sub != nil {
 		// This is a post to a subscribed topic. The message is sent to the topic only
-		sub.broadcast <- data
+		select {
+		case sub.broadcast <- data:
+		default:
+			// Reply with a 500 to the user.
+			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
+			logs.Err.Println("s.publish: sub.broadcast channel full, topic ", msg.RcptTo, s.sid)
+		}
 	} else if msg.RcptTo == "sys" {
 		// Publishing to "sys" topic requires no subsription.
-		globals.hub.route <- data
+		select {
+		case globals.hub.route <- data:
+		default:
+			// Reply with a 500 to the user.
+			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
+			logs.Err.Println("s.publish: hub.route channel full", s.sid)
+		}
 	} else {
 		// Publish request received without attaching to topic first.
 		s.queueOut(ErrAttachFirst(msg, msg.Timestamp))
-		log.Println("s.publish:", "must attach first", s.sid)
+		logs.Warn.Println("s.publish:", "must attach first", s.sid)
 	}
 }
 
@@ -645,7 +669,7 @@ func (s *Session) hello(msg *ClientComMessage) {
 	if s.ver == 0 {
 		s.ver = parseVersion(msg.Hi.Version)
 		if s.ver == 0 {
-			log.Println("s.hello:", "failed to parse version", s.sid)
+			logs.Warn.Println("s.hello:", "failed to parse version", s.sid)
 			s.queueOut(ErrMalformed(msg.Id, "", msg.Timestamp))
 			return
 		}
@@ -653,7 +677,7 @@ func (s *Session) hello(msg *ClientComMessage) {
 		if versionCompare(s.ver, minSupportedVersionValue) < 0 {
 			s.ver = 0
 			s.queueOut(ErrVersionNotSupported(msg.Id, msg.Timestamp))
-			log.Println("s.hello:", "unsupported version", s.sid)
+			logs.Warn.Println("s.hello:", "unsupported version", s.sid)
 			return
 		}
 
@@ -698,7 +722,7 @@ func (s *Session) hello(msg *ClientComMessage) {
 			}
 
 			if err != nil {
-				log.Println("s.hello:", "device ID", err, s.sid)
+				logs.Warn.Println("s.hello:", "device ID", err, s.sid)
 				s.queueOut(ErrUnknown(msg.Id, "", msg.Timestamp))
 				return
 			}
@@ -706,7 +730,7 @@ func (s *Session) hello(msg *ClientComMessage) {
 	} else {
 		// Version cannot be changed mid-session.
 		s.queueOut(ErrCommandOutOfSequence(msg.Id, "", msg.Timestamp))
-		log.Println("s.hello:", "version cannot be changed", s.sid)
+		logs.Warn.Println("s.hello:", "version cannot be changed", s.sid)
 		return
 	}
 
@@ -725,7 +749,7 @@ func (s *Session) hello(msg *ClientComMessage) {
 		if len(s.lang) > 2 {
 			// Logging strings longer than 2 b/c language.Parse(XX) always succeeds
 			// returning confidence Low.
-			log.Println("s.hello:", "could not parse locale ", s.lang)
+			logs.Warn.Println("s.hello:", "could not parse locale ", s.lang)
 		}
 		s.countryCode = globals.defaultCountryCode
 	}
@@ -758,16 +782,16 @@ func (s *Session) acc(msg *ClientComMessage) {
 	if msg.Acc.Token != nil {
 		if !s.uid.IsZero() {
 			s.queueOut(ErrAlreadyAuthenticated(msg.Acc.Id, "", msg.Timestamp))
-			log.Println("s.acc: got token while already authenticated", s.sid)
+			logs.Warn.Println("s.acc: got token while already authenticated", s.sid)
 			return
 		}
 
 		var err error
-		rec, _, err = store.GetLogicalAuthHandler("token").Authenticate(msg.Acc.Token)
+		rec, _, err = store.GetLogicalAuthHandler("token").Authenticate(msg.Acc.Token, s.remoteAddr)
 		if err != nil {
 			s.queueOut(decodeStoreError(err, msg.Acc.Id, "", msg.Timestamp,
 				map[string]interface{}{"what": "auth"}))
-			log.Println("s.acc: invalid token", err, s.sid)
+			logs.Warn.Println("s.acc: invalid token", err, s.sid)
 			return
 		}
 	}
@@ -803,17 +827,17 @@ func (s *Session) login(msg *ClientComMessage) {
 
 	handler := store.GetLogicalAuthHandler(msg.Login.Scheme)
 	if handler == nil {
-		log.Println("s.login: unknown authentication scheme", msg.Login.Scheme, s.sid)
+		logs.Warn.Println("s.login: unknown authentication scheme", msg.Login.Scheme, s.sid)
 		s.queueOut(ErrAuthUnknownScheme(msg.Id, "", msg.Timestamp))
 		return
 	}
 
-	rec, challenge, err := handler.Authenticate(msg.Login.Secret)
+	rec, challenge, err := handler.Authenticate(msg.Login.Secret, s.remoteAddr)
 	if err != nil {
 		resp := decodeStoreError(err, msg.Id, "", msg.Timestamp, nil)
 		if resp.Ctrl.Code >= 500 {
 			// Log internal errors
-			log.Println("s.login: internal", err, s.sid)
+			logs.Warn.Println("s.login: internal", err, s.sid)
 		}
 		s.queueOut(resp)
 		return
@@ -828,7 +852,7 @@ func (s *Session) login(msg *ClientComMessage) {
 	}
 
 	if err != nil {
-		log.Println("s.login: user state check failed", rec.Uid, err, s.sid)
+		logs.Warn.Println("s.login: user state check failed", rec.Uid, err, s.sid)
 		s.queueOut(decodeStoreError(err, msg.Id, "", msg.Timestamp, nil))
 		return
 	}
@@ -849,7 +873,7 @@ func (s *Session) login(msg *ClientComMessage) {
 		}
 	}
 	if err != nil {
-		log.Println("s.login: failed to validate credentials:", err, s.sid)
+		logs.Warn.Println("s.login: failed to validate credentials:", err, s.sid)
 		s.queueOut(decodeStoreError(err, msg.Id, "", msg.Timestamp, nil))
 	} else {
 		s.queueOut(s.onLogin(msg.Id, msg.Timestamp, rec, missing))
@@ -892,7 +916,7 @@ func (s *Session) authSecretReset(params []byte) error {
 	token, _, err := store.GetLogicalAuthHandler("token").GenSecret(&auth.Rec{
 		Uid:       uid,
 		AuthLevel: auth.LevelAuth,
-		Lifetime:  time.Hour * 24,
+		Lifetime:  auth.Duration(time.Hour * 24),
 		Features:  auth.FeatureNoLogin})
 
 	if err != nil {
@@ -941,7 +965,7 @@ func (s *Session) onLogin(msgID string, timestamp time.Time, rec *auth.Rec, miss
 				LastSeen: timestamp,
 				Lang:     s.lang,
 			}); err != nil {
-				log.Println("failed to update device record", err)
+				logs.Warn.Println("failed to update device record", err)
 			}
 		}
 	}
@@ -973,14 +997,26 @@ func (s *Session) get(msg *ClientComMessage) {
 
 	if meta.pkt.MetaWhat == 0 {
 		s.queueOut(ErrMalformedReply(msg, msg.Timestamp))
-		log.Println("s.get: invalid Get message action", msg.Get.What)
+		logs.Warn.Println("s.get: invalid Get message action", msg.Get.What)
 	} else if sub != nil {
-		sub.meta <- meta
+		select {
+		case sub.meta <- meta:
+		default:
+			// Reply with a 500 to the user.
+			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
+			logs.Err.Println("s.get: sub.meta channel full, topic ", msg.RcptTo, s.sid)
+		}
 	} else if meta.pkt.MetaWhat&(constMsgMetaDesc|constMsgMetaSub) != 0 {
 		// Request some minimal info from a topic not currently attached to.
-		globals.hub.meta <- meta
+		select {
+		case globals.hub.meta <- meta:
+		default:
+			// Reply with a 500 to the user.
+			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
+			logs.Err.Println("s.get: hub.meta channel full", s.sid)
+		}
 	} else {
-		log.Println("s.get: subscribe first to get=", msg.Get.What)
+		logs.Warn.Println("s.get: subscribe first to get=", msg.Get.What)
 		s.queueOut(ErrPermissionDeniedReply(msg, msg.Timestamp))
 	}
 }
@@ -1013,15 +1049,27 @@ func (s *Session) set(msg *ClientComMessage) {
 
 	if meta.pkt.MetaWhat == 0 {
 		s.queueOut(ErrMalformedReply(msg, msg.Timestamp))
-		log.Println("s.set: nil Set action")
+		logs.Warn.Println("s.set: nil Set action")
 	} else if sub := s.getSub(msg.RcptTo); sub != nil {
-		sub.meta <- meta
+		select {
+		case sub.meta <- meta:
+		default:
+			// Reply with a 500 to the user.
+			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
+			logs.Err.Println("s.set: sub.meta channel full, topic ", msg.RcptTo, s.sid)
+		}
 	} else if meta.pkt.MetaWhat&(constMsgMetaTags|constMsgMetaCred) != 0 {
-		log.Println("s.set: can Set tags/creds for subscribed topics only", meta.pkt.MetaWhat)
+		logs.Warn.Println("s.set: can Set tags/creds for subscribed topics only", meta.pkt.MetaWhat)
 		s.queueOut(ErrPermissionDeniedReply(msg, msg.Timestamp))
 	} else {
 		// Desc.Private and Sub updates are possible without the subscription.
-		globals.hub.meta <- meta
+		select {
+		case globals.hub.meta <- meta:
+		default:
+			// Reply with a 500 to the user.
+			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
+			logs.Err.Println("s.set: hub.meta channel full", s.sid)
+		}
 	}
 }
 
@@ -1046,27 +1094,39 @@ func (s *Session) del(msg *ClientComMessage) {
 
 	if msg.MetaWhat == 0 {
 		s.queueOut(ErrMalformedReply(msg, msg.Timestamp))
-		log.Println("s.del: invalid Del action", msg.Del.What, s.sid)
+		logs.Warn.Println("s.del: invalid Del action", msg.Del.What, s.sid)
 		return
 	}
 	sub := s.getSub(msg.RcptTo)
 	if sub != nil && msg.MetaWhat != constMsgDelTopic {
 		// Session is attached, deleting subscription or messages. Send to topic.
-		sub.meta <- &metaReq{
+		select {
+		case sub.meta <- &metaReq{
 			pkt:  msg,
-			sess: s}
+			sess: s}:
+		default:
+			// Reply with a 500 to the user.
+			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
+			logs.Err.Println("s.del: sub.meta channel full, topic ", msg.RcptTo, s.sid)
+		}
 	} else if msg.MetaWhat == constMsgDelTopic {
 		// Deleting topic: for sessions attached or not attached, send request to hub first.
 		// Hub will forward to topic, if appropriate.
-		globals.hub.unreg <- &topicUnreg{
+		select {
+		case globals.hub.unreg <- &topicUnreg{
 			rcptTo: msg.RcptTo,
 			pkt:    msg,
 			sess:   s,
-			del:    true}
+			del:    true}:
+		default:
+			// Reply with a 500 to the user.
+			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
+			logs.Err.Println("s.del: hub.unreg channel full", s.sid)
+		}
 	} else {
 		// Must join the topic to delete messages or subscriptions.
 		s.queueOut(ErrAttachFirst(msg, msg.Timestamp))
-		log.Println("s.del: invalid Del action while unsubbed", msg.Del.What, s.sid)
+		logs.Warn.Println("s.del: invalid Del action while unsubbed", msg.Del.What, s.sid)
 	}
 }
 
@@ -1100,22 +1160,40 @@ func (s *Session) note(msg *ClientComMessage) {
 		return
 	}
 
+	response := &ServerComMessage{
+		Info: &MsgServerInfo{
+			Topic: msg.Original,
+			From:  msg.AsUser,
+			What:  msg.Note.What,
+			SeqId: msg.Note.SeqId},
+		RcptTo:    msg.RcptTo,
+		AsUser:    msg.AsUser,
+		Timestamp: msg.Timestamp,
+		SkipSid:   s.sid,
+		sess:      s}
 	if sub := s.getSub(msg.RcptTo); sub != nil {
 		// Pings can be sent to subscribed topics only
-		sub.broadcast <- &ServerComMessage{
-			Info: &MsgServerInfo{
-				Topic: msg.Original,
-				From:  msg.AsUser,
-				What:  msg.Note.What,
-				SeqId: msg.Note.SeqId},
-			RcptTo:    msg.RcptTo,
-			AsUser:    msg.AsUser,
-			Timestamp: msg.Timestamp,
-			SkipSid:   s.sid,
-			sess:      s}
+		select {
+		case sub.broadcast <- response:
+		default:
+			// Reply with a 500 to the user.
+			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
+			logs.Err.Println("s.note: sub.broacast channel full, topic ", msg.RcptTo, s.sid)
+		}
+	} else if msg.Note.What == "recv" {
+		// Client received a pres notification about a new message, initiated a fetch
+		// from the server (and detached from the topic) and acknowledges receipt.
+		// Hub will forward to topic, if appropriate.
+		select {
+		case globals.hub.route <- response:
+		default:
+			// Reply with a 500 to the user.
+			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
+			logs.Err.Println("s.note: hub.route channel full", s.sid)
+		}
 	} else {
 		s.queueOut(ErrAttachFirst(msg, msg.Timestamp))
-		log.Println("s.note: note to invalid topic - must subscribe first", msg.Note.What, s.sid)
+		logs.Warn.Println("s.note: note to invalid topic - must subscribe first", msg.Note.What, s.sid)
 	}
 }
 
@@ -1127,7 +1205,7 @@ func (s *Session) note(msg *ClientComMessage) {
 func (s *Session) expandTopicName(msg *ClientComMessage) (string, *ServerComMessage) {
 
 	if msg.Original == "" {
-		log.Println("s.etn: empty topic name", s.sid)
+		logs.Warn.Println("s.etn: empty topic name", s.sid)
 		return "", ErrMalformed(msg.Id, "", msg.Timestamp)
 	}
 
@@ -1143,11 +1221,11 @@ func (s *Session) expandTopicName(msg *ClientComMessage) (string, *ServerComMess
 		uid2 := types.ParseUserId(msg.Original)
 		if uid2.IsZero() {
 			// Ensure the user id is valid.
-			log.Println("s.etn: failed to parse p2p topic name", s.sid)
+			logs.Warn.Println("s.etn: failed to parse p2p topic name", s.sid)
 			return "", ErrMalformed(msg.Id, msg.Original, msg.Timestamp)
 		} else if uid2 == uid1 {
 			// Use 'me' to access self-topic.
-			log.Println("s.etn: invalid p2p self-subscription", s.sid)
+			logs.Warn.Println("s.etn: invalid p2p self-subscription", s.sid)
 			return "", ErrPermissionDeniedReply(msg, msg.Timestamp)
 		}
 		routeTo = uid1.P2PName(uid2)

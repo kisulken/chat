@@ -61,9 +61,9 @@ import (
 
 const (
 	// currentVersion is the current API/protocol version
-	currentVersion = "0.16"
+	currentVersion = "0.17"
 	// minSupportedVersion is the minimum supported API version
-	minSupportedVersion = "0.15"
+	minSupportedVersion = "0.16"
 
 	// idleSessionTimeout defines duration of being idle before terminating a session.
 	idleSessionTimeout = time.Second * 55
@@ -170,7 +170,7 @@ var globals struct {
 	// Maximum allowed upload size.
 	maxFileUploadSize int64
 
-	// Prioritise X-Forwarded-For header as the source of IP address of the client.
+	// Prioritize X-Forwarded-For header as the source of IP address of the client.
 	useXForwardedFor bool
 
 	// Country code to assign to sessions by default.
@@ -257,18 +257,19 @@ type configType struct {
 func main() {
 	executable, _ := os.Executable()
 
-	var logFlags = flag.String("log_flags", "stdFlags", "Comma-separated list of log flags (as defined in https://golang.org/pkg/log/#pkg-constants without the L prefix)")
-	var configfile = flag.String("config", "tinode.conf", "Path to config file.")
+	logFlags := flag.String("log_flags", "stdFlags",
+		"Comma-separated list of log flags (as defined in https://golang.org/pkg/log/#pkg-constants without the L prefix)")
+	configfile := flag.String("config", "tinode.conf", "Path to config file.")
 	// Path to static content.
-	var staticPath = flag.String("static_data", defaultStaticPath, "File path to directory with static files to be served.")
-	var listenOn = flag.String("listen", "", "Override address and port to listen on for HTTP(S) clients.")
-	var apiPath = flag.String("api_path", "", "Override the base URL path where API is served.")
-	var listenGrpc = flag.String("grpc_listen", "", "Override address and port to listen on for gRPC clients.")
-	var tlsEnabled = flag.Bool("tls_enabled", false, "Override config value for enabling TLS.")
-	var clusterSelf = flag.String("cluster_self", "", "Override the name of the current cluster node.")
-	var expvarPath = flag.String("expvar", "", "Override the URL path where runtime stats are exposed. Use '-' to disable.")
-	var pprofFile = flag.String("pprof", "", "File name to save profiling info to. Disabled if not set.")
-	var pprofUrl = flag.String("pprof_url", "", "Debugging only! URL path for exposing profiling info. Disabled if not set.")
+	staticPath := flag.String("static_data", defaultStaticPath, "File path to directory with static files to be served.")
+	listenOn := flag.String("listen", "", "Override address and port to listen on for HTTP(S) clients.")
+	apiPath := flag.String("api_path", "", "Override the base URL path where API is served.")
+	listenGrpc := flag.String("grpc_listen", "", "Override address and port to listen on for gRPC clients.")
+	tlsEnabled := flag.Bool("tls_enabled", false, "Override config value for enabling TLS.")
+	clusterSelf := flag.String("cluster_self", "", "Override the name of the current cluster node.")
+	expvarPath := flag.String("expvar", "", "Override the URL path where runtime stats are exposed. Use '-' to disable.")
+	pprofFile := flag.String("pprof", "", "File name to save profiling info to. Disabled if not set.")
+	pprofUrl := flag.String("pprof_url", "", "Debugging only! URL path for exposing profiling info. Disabled if not set.")
 	flag.Parse()
 
 	logs.Init(os.Stderr, *logFlags)
@@ -355,16 +356,17 @@ func main() {
 		logs.Info.Printf("Profiling info saved to '%s.(cpu|mem)'", *pprofFile)
 	}
 
-	err := store.Open(workerId, config.Store)
+	err := store.Store.Open(workerId, config.Store)
 	if err != nil {
 		logs.Err.Fatal("Failed to connect to DB: ", err)
 	}
-	logs.Info.Println("DB adapter", store.GetAdapterName())
+	logs.Info.Println("DB adapter", store.Store.GetAdapterName())
 	defer func() {
-		store.Close()
+		store.Store.Close()
 		logs.Info.Println("Closed database connection(s)")
 		logs.Info.Println("All done, good bye")
 	}()
+	statsRegisterDbStats()
 
 	// API key signing secret
 	globals.apiKeySalt = config.APIKeySalt
@@ -378,9 +380,9 @@ func main() {
 	// by the client, e.g. 'email' or 'tel'.
 	globals.immutableTagNS = make(map[string]bool)
 
-	authNames := store.GetAuthNames()
+	authNames := store.Store.GetAuthNames()
 	for _, name := range authNames {
-		if authhdl := store.GetLogicalAuthHandler(name); authhdl == nil {
+		if authhdl := store.Store.GetLogicalAuthHandler(name); authhdl == nil {
 			logs.Err.Fatalln("Unknown authenticator", name)
 		} else if jsconf := config.Auth[name]; jsconf != nil {
 			if err := authhdl.Init(jsconf, name); err != nil {
@@ -437,7 +439,7 @@ func main() {
 			continue
 		}
 
-		if val := store.GetValidator(name); val == nil {
+		if val := store.Store.GetValidator(name); val == nil {
 			logs.Err.Fatal("Config provided for an unknown validator '" + name + "'")
 		} else if err = val.Init(string(vconf.Config)); err != nil {
 			logs.Err.Fatal("Failed to init validator '"+name+"': ", err)
@@ -447,7 +449,8 @@ func main() {
 		}
 		globals.validators[name] = credValidator{
 			requiredAuthLvl: reqLevels,
-			addToTags:       vconf.AddToTags}
+			addToTags:       vconf.AddToTags,
+		}
 	}
 
 	// Partially restricted tag namespaces
@@ -506,7 +509,7 @@ func main() {
 				if params := config.Media.Handlers[config.Media.UseHandler]; params != nil {
 					conf = string(params)
 				}
-				if err = store.UseMediaHandler(config.Media.UseHandler, conf); err != nil {
+				if err = store.Store.UseMediaHandler(config.Media.UseHandler, conf); err != nil {
 					logs.Err.Fatalf("Failed to init media handler '%s': %s", config.Media.UseHandler, err)
 				}
 			}
@@ -545,7 +548,7 @@ func main() {
 		logs.Err.Fatalln(err)
 	}
 
-	// Intialize plugins
+	// Initialize plugins.
 	pluginsInit(config.Plugin)
 
 	// Initialize users cache

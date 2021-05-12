@@ -34,6 +34,8 @@ type Adapter interface {
 	UpgradeDb() error
 	// Version returns adapter version
 	Version() int
+	// DB connection stats object.
+	Stats() interface{}
 
 	// User management
 
@@ -100,6 +102,8 @@ type Adapter interface {
 	UsersForTopic(topic string, keepDeleted bool, opts *t.QueryOpt) ([]t.Subscription, error)
 	// OwnTopics loads a slice of topic names where the user is the owner.
 	OwnTopics(uid t.Uid) ([]string, error)
+	// ChannelsForUser loads a slice of topic names where the user is a channel reader and notifications (P) are enabled.
+	ChannelsForUser(uid t.Uid) ([]string, error)
 	// TopicShare creates topc subscriptions
 	TopicShare(subs []*t.Subscription) error
 	// TopicDelete deletes topic, subscription, messages
@@ -114,18 +118,15 @@ type Adapter interface {
 
 	// SubscriptionGet reads a subscription of a user to a topic
 	SubscriptionGet(topic string, user t.Uid) (*t.Subscription, error)
-	// SubsForUser gets a list of topics of interest for a given user. Does NOT load Public value.
-	SubsForUser(user t.Uid, keepDeleted bool, opts *t.QueryOpt) ([]t.Subscription, error)
+	// SubsForUser loads all subscriptions of a given user. Does NOT load Public or Private values,
+	// does not load deleted subscriptions.
+	SubsForUser(user t.Uid) ([]t.Subscription, error)
 	// SubsForTopic gets a list of subscriptions to a given topic.. Does NOT load Public value.
 	SubsForTopic(topic string, keepDeleted bool, opts *t.QueryOpt) ([]t.Subscription, error)
 	// SubsUpdate updates pasrt of a subscription object. Pass nil for fields which don't need to be updated
 	SubsUpdate(topic string, user t.Uid, update map[string]interface{}) error
 	// SubsDelete deletes a single subscription
 	SubsDelete(topic string, user t.Uid) error
-	// SubsDelForTopic deletes all subscriptions to the given topic
-	SubsDelForTopic(topic string, hard bool) error
-	// SubsDelForUser deletes or marks as deleted all subscriptions of the given user.
-	SubsDelForUser(user t.Uid, hard bool) error
 
 	// Search
 

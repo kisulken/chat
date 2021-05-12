@@ -29,11 +29,6 @@ import (
 	"golang.org/x/text/language"
 )
 
-// Wait time before abandoning the outbound send operation.
-// Timeout is rather long to make sure it's longer than Linux preeption time:
-// https://elixir.bootlin.com/linux/latest/source/kernel/sched/fair.c#L38
-const sendTimeout = time.Millisecond * 7
-
 // Maximum number of queued messages before session is considered stale and dropped.
 const sendQueueLimit = 128
 
@@ -84,7 +79,8 @@ type Session struct {
 	clnode *ClusterNode
 
 	// Reference to multiplexing session. Set only for proxy sessions.
-	multi *Session
+	multi        *Session
+	proxiedTopic string
 
 	// IP address of the client. For long polling this is the IP of the last poll.
 	remoteAddr string
@@ -117,8 +113,6 @@ type Session struct {
 	// Time when the session received any packer from client
 	lastAction int64
 
-	// Background session: subscription presence notifications and online status are delayed.
-	background bool
 	// Timer which triggers after some seconds to mark background session as foreground.
 	bkgTimer *time.Timer
 
@@ -134,6 +128,9 @@ type Session struct {
 	// 0 = false
 	// 1 = true
 	terminating int32
+
+	// Background session: subscription presence notifications and online status are delayed.
+	background bool
 
 	// Outbound mesages, buffered.
 	// The content must be serialized in format suitable for the session.
@@ -235,14 +232,6 @@ func (s *Session) unsubAll() {
 	}
 }
 
-// Represents a proxied (remote) session.
-type remoteSession struct {
-	// User id of the proxied session.
-	uid types.Uid
-	// Whether the proxied session is background.
-	isBackground bool
-}
-
 // Indicates whether this session is a local interface for a remote proxy topic.
 // It multiplexes multiple sessions.
 func (s *Session) isMultiplex() bool {
@@ -259,8 +248,68 @@ func (s *Session) isCluster() bool {
 	return s.isProxy() || s.isMultiplex()
 }
 
-// queueOut attempts to send a ServerComMessage to a session write loop; if the send buffer is full,
-// timeout is `sendTimeout`.
+func (s *Session) scheduleClusterWriteLoop() {
+	if globals.cluster != nil && globals.cluster.proxyEventQueue != nil {
+		globals.cluster.proxyEventQueue.Schedule(
+			func() { s.clusterWriteLoop(s.proxiedTopic) })
+	}
+}
+
+func (s *Session) supportsMessageBatching() bool {
+	switch s.proto {
+	case WEBSOCK:
+		return true
+	case GRPC:
+		return true
+	default:
+		return false
+	}
+}
+
+// queueOut attempts to send a list of ServerComMessages to a session write loop;
+// it fails if the send buffer is full.
+func (s *Session) queueOutBatch(msgs []*ServerComMessage) bool {
+	if s == nil {
+		return true
+	}
+	if atomic.LoadInt32(&s.terminating) > 0 {
+		return true
+	}
+
+	if s.multi != nil {
+		// In case of a cluster we need to pass a copy of the actual session.
+		for i := range msgs {
+			msgs[i].sess = s
+		}
+		if s.multi.queueOutBatch(msgs) {
+			s.multi.scheduleClusterWriteLoop()
+			return true
+		}
+		return false
+	}
+
+	if s.supportsMessageBatching() {
+		select {
+		case s.send <- msgs:
+		default:
+			// Never block here since it may also block the topic's run() goroutine.
+			logs.Err.Println("s.queueOut: session's send queue2 full", s.sid)
+			return false
+		}
+		if s.isMultiplex() {
+			s.scheduleClusterWriteLoop()
+		}
+	} else {
+		for _, msg := range msgs {
+			s.queueOut(msg)
+		}
+	}
+
+	return true
+}
+
+// queueOut attempts to send a ServerComMessage to a session write loop;
+// it fails, if the send buffer is full.
 func (s *Session) queueOut(msg *ServerComMessage) bool {
 	if s == nil {
 		return true
@@ -272,7 +321,11 @@ func (s *Session) queueOut(msg *ServerComMessage) bool {
 	if s.multi != nil {
 		// In case of a cluster we need to pass a copy of the actual session.
 		msg.sess = s
-		return s.multi.queueOut(msg)
+		if s.multi.queueOut(msg) {
+			s.multi.scheduleClusterWriteLoop()
+			return true
+		}
+		return false
 	}
 
 	// Record latency only on {ctrl} messages and end-user sessions.
@@ -288,22 +341,21 @@ func (s *Session) queueOut(msg *ServerComMessage) bool {
 		}
 	}
 
-	dataSize, data := s.serialize(msg)
-	if dataSize >= 0 {
-		statsAddHistSample("OutgoingMessageSize", float64(dataSize))
-	}
 	select {
-	case s.send <- data:
+	case s.send <- msg:
 	default:
 		// Never block here since it may also block the topic's run() goroutine.
 		logs.Err.Println("s.queueOut: session's send queue full", s.sid)
 		return false
 	}
+	if s.isMultiplex() {
+		s.scheduleClusterWriteLoop()
+	}
 	return true
 }
 
 // queueOutBytes attempts to send a ServerComMessage already serialized to []byte.
-// If the send buffer is full, timeout is `sendTimeout`.
+// If the send buffer is full, it fails.
 func (s *Session) queueOutBytes(data []byte) bool {
 	if s == nil || atomic.LoadInt32(&s.terminating) > 0 {
 		return true
@@ -315,17 +367,32 @@ func (s *Session) queueOutBytes(data []byte) bool {
 		logs.Err.Println("s.queueOutBytes: session's send queue full", s.sid)
 		return false
 	}
+	if s.isMultiplex() {
+		s.scheduleClusterWriteLoop()
+	}
 	return true
+}
+
+func (s *Session) maybeScheduleClusterWriteLoop() {
+	if s.multi != nil {
+		s.multi.scheduleClusterWriteLoop()
+		return
+	}
+	if s.isMultiplex() {
+		s.scheduleClusterWriteLoop()
+	}
 }
 
 func (s *Session) detachSession(fromTopic string) {
 	if atomic.LoadInt32(&s.terminating) == 0 {
 		s.detach <- fromTopic
+		s.maybeScheduleClusterWriteLoop()
 	}
 }
 
 func (s *Session) stopSession(data interface{}) {
 	s.stop <- data
+	s.maybeScheduleClusterWriteLoop()
 }
 
 func (s *Session) purgeChannels() {
@@ -552,7 +619,8 @@ func (s *Session) subscribe(msg *ClientComMessage) {
 		select {
 		case globals.hub.join <- &sessionJoin{
 			pkt:  msg,
-			sess: s}:
+			sess: s,
+		}:
 		default:
 			// Reply with a 500 to the user.
 			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
@@ -584,7 +652,8 @@ func (s *Session) leave(msg *ClientComMessage) {
 			s.inflightReqs.Add(1)
 			sub.done <- &sessionLeave{
 				pkt:  msg,
-				sess: s}
+				sess: s,
+			}
 		}
 	} else if !msg.Leave.Unsub {
 		// Session is not attached to the topic, wants to leave - fine, no change
@@ -621,18 +690,21 @@ func (s *Session) publish(msg *ClientComMessage) {
 		}
 	}
 
-	data := &ServerComMessage{Data: &MsgServerData{
-		Topic:     msg.Original,
-		From:      msg.AsUser,
-		Timestamp: msg.Timestamp,
-		Head:      msg.Pub.Head,
-		Content:   msg.Pub.Content},
+	data := &ServerComMessage{
+		Data: &MsgServerData{
+			Topic:     msg.Original,
+			From:      msg.AsUser,
+			Timestamp: msg.Timestamp,
+			Head:      msg.Pub.Head,
+			Content:   msg.Pub.Content,
+		},
 		// Internal-only values.
 		Id:        msg.Id,
 		RcptTo:    msg.RcptTo,
 		AsUser:    msg.AsUser,
 		Timestamp: msg.Timestamp,
-		sess:      s}
+		sess:      s,
+	}
 	if msg.Pub.NoEcho {
 		data.SkipSid = s.sid
 	}
@@ -657,7 +729,7 @@ func (s *Session) publish(msg *ClientComMessage) {
 	} else {
 		// Publish request received without attaching to topic first.
 		s.queueOut(ErrAttachFirst(msg, msg.Timestamp))
-		logs.Warn.Println("s.publish:", "must attach first", s.sid)
+		logs.Warn.Printf("s.publish[%s]: must attach first %s", msg.RcptTo, s.sid)
 	}
 }
 
@@ -683,7 +755,7 @@ func (s *Session) hello(msg *ClientComMessage) {
 
 		params = map[string]interface{}{
 			"ver":                currentVersion,
-			"build":              store.GetAdapterName() + ":" + buildstamp,
+			"build":              store.Store.GetAdapterName() + ":" + buildstamp,
 			"maxMessageSize":     globals.maxMessageSize,
 			"maxSubscriberCount": globals.maxSubscriberCount,
 			"minTagLength":       minTagLength,
@@ -711,7 +783,7 @@ func (s *Session) hello(msg *ClientComMessage) {
 			if msg.Hi.DeviceID == types.NullValue {
 				deviceIDUpdate = true
 				err = store.Devices.Delete(s.uid, s.deviceID)
-			} else if msg.Hi.DeviceID != "" {
+			} else if msg.Hi.DeviceID != "" && s.deviceID != msg.Hi.DeviceID {
 				deviceIDUpdate = true
 				err = store.Devices.Update(s.uid, s.deviceID, &types.DeviceDef{
 					DeviceId: msg.Hi.DeviceID,
@@ -719,6 +791,8 @@ func (s *Session) hello(msg *ClientComMessage) {
 					LastSeen: msg.Timestamp,
 					Lang:     msg.Hi.Lang,
 				})
+
+				userChannelsSubUnsub(s.uid, msg.Hi.DeviceID, true)
 			}
 
 			if err != nil {
@@ -776,7 +850,6 @@ func (s *Session) hello(msg *ClientComMessage) {
 
 // Account creation
 func (s *Session) acc(msg *ClientComMessage) {
-
 	// If token is provided, get the user ID from it.
 	var rec *auth.Rec
 	if msg.Acc.Token != nil {
@@ -787,7 +860,7 @@ func (s *Session) acc(msg *ClientComMessage) {
 		}
 
 		var err error
-		rec, _, err = store.GetLogicalAuthHandler("token").Authenticate(msg.Acc.Token, s.remoteAddr)
+		rec, _, err = store.Store.GetLogicalAuthHandler("token").Authenticate(msg.Acc.Token, s.remoteAddr)
 		if err != nil {
 			s.queueOut(decodeStoreError(err, msg.Acc.Id, "", msg.Timestamp,
 				map[string]interface{}{"what": "auth"}))
@@ -825,7 +898,7 @@ func (s *Session) login(msg *ClientComMessage) {
 		return
 	}
 
-	handler := store.GetLogicalAuthHandler(msg.Login.Scheme)
+	handler := store.Store.GetLogicalAuthHandler(msg.Login.Scheme)
 	if handler == nil {
 		logs.Warn.Println("s.login: unknown authentication scheme", msg.Login.Scheme, s.sid)
 		s.queueOut(ErrAuthUnknownScheme(msg.Id, "", msg.Timestamp))
@@ -892,11 +965,11 @@ func (s *Session) authSecretReset(params []byte) error {
 
 	// Technically we don't need to check it here, but we are going to mail the 'authName' string to the user.
 	// We have to make sure it does not contain any exploits. This is the simplest check.
-	hdl := store.GetLogicalAuthHandler(authScheme)
+	hdl := store.Store.GetLogicalAuthHandler(authScheme)
 	if hdl == nil {
 		return types.ErrUnsupported
 	}
-	validator := store.GetValidator(credMethod)
+	validator := store.Store.GetValidator(credMethod)
 	if validator == nil {
 		return types.ErrUnsupported
 	}
@@ -913,12 +986,12 @@ func (s *Session) authSecretReset(params []byte) error {
 		return err
 	}
 
-	token, _, err := store.GetLogicalAuthHandler("token").GenSecret(&auth.Rec{
+	token, _, err := store.Store.GetLogicalAuthHandler("token").GenSecret(&auth.Rec{
 		Uid:       uid,
 		AuthLevel: auth.LevelAuth,
 		Lifetime:  auth.Duration(time.Hour * 24),
-		Features:  auth.FeatureNoLogin})
-
+		Features:  auth.FeatureNoLogin,
+	})
 	if err != nil {
 		return err
 	}
@@ -928,7 +1001,6 @@ func (s *Session) authSecretReset(params []byte) error {
 
 // onLogin performs steps after successful authentication.
 func (s *Session) onLogin(msgID string, timestamp time.Time, rec *auth.Rec, missing []string) *ServerComMessage {
-
 	var reply *ServerComMessage
 	var params map[string]interface{}
 
@@ -936,7 +1008,8 @@ func (s *Session) onLogin(msgID string, timestamp time.Time, rec *auth.Rec, miss
 
 	params = map[string]interface{}{
 		"user":    rec.Uid.UserId(),
-		"authlvl": rec.AuthLevel.String()}
+		"authlvl": rec.AuthLevel.String(),
+	}
 	if len(missing) > 0 {
 		// Some credentials are not validated yet. Respond with request for validation.
 		reply = InfoValidateCredentials(msgID, timestamp)
@@ -973,7 +1046,7 @@ func (s *Session) onLogin(msgID string, timestamp time.Time, rec *auth.Rec, miss
 	// GenSecret fails only if tokenLifetime is < 0. It can't be < 0 here,
 	// otherwise login would have failed earlier.
 	rec.Features = features
-	params["token"], params["expires"], _ = store.GetLogicalAuthHandler("token").GenSecret(rec)
+	params["token"], params["expires"], _ = store.Store.GetLogicalAuthHandler("token").GenSecret(rec)
 
 	reply.Ctrl.Params = params
 	return reply
@@ -993,7 +1066,8 @@ func (s *Session) get(msg *ClientComMessage) {
 	sub := s.getSub(msg.RcptTo)
 	meta := &metaReq{
 		pkt:  msg,
-		sess: s}
+		sess: s,
+	}
 
 	if meta.pkt.MetaWhat == 0 {
 		s.queueOut(ErrMalformedReply(msg, msg.Timestamp))
@@ -1032,7 +1106,8 @@ func (s *Session) set(msg *ClientComMessage) {
 
 	meta := &metaReq{
 		pkt:  msg,
-		sess: s}
+		sess: s,
+	}
 
 	if msg.Set.Desc != nil {
 		meta.pkt.MetaWhat = constMsgMetaDesc
@@ -1103,7 +1178,8 @@ func (s *Session) del(msg *ClientComMessage) {
 		select {
 		case sub.meta <- &metaReq{
 			pkt:  msg,
-			sess: s}:
+			sess: s,
+		}:
 		default:
 			// Reply with a 500 to the user.
 			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
@@ -1117,7 +1193,8 @@ func (s *Session) del(msg *ClientComMessage) {
 			rcptTo: msg.RcptTo,
 			pkt:    msg,
 			sess:   s,
-			del:    true}:
+			del:    true,
+		}:
 		default:
 			// Reply with a 500 to the user.
 			s.queueOut(ErrUnknownReply(msg, msg.Timestamp))
@@ -1133,7 +1210,6 @@ func (s *Session) del(msg *ClientComMessage) {
 // Broadcast a transient {ping} message to active topic subscribers
 // Not reporting any errors
 func (s *Session) note(msg *ClientComMessage) {
-
 	if s.ver == 0 || msg.AsUser == "" {
 		// Silently ignore the message: have not received {hi} or don't know who sent the message.
 		return
@@ -1165,12 +1241,14 @@ func (s *Session) note(msg *ClientComMessage) {
 			Topic: msg.Original,
 			From:  msg.AsUser,
 			What:  msg.Note.What,
-			SeqId: msg.Note.SeqId},
+			SeqId: msg.Note.SeqId,
+		},
 		RcptTo:    msg.RcptTo,
 		AsUser:    msg.AsUser,
 		Timestamp: msg.Timestamp,
 		SkipSid:   s.sid,
-		sess:      s}
+		sess:      s,
+	}
 	if sub := s.getSub(msg.RcptTo); sub != nil {
 		// Pings can be sent to subscribed topics only
 		select {
@@ -1203,7 +1281,6 @@ func (s *Session) note(msg *ClientComMessage) {
 //   routeTo: routable global topic name
 //   err: *ServerComMessage with an error to return to the sender
 func (s *Session) expandTopicName(msg *ClientComMessage) (string, *ServerComMessage) {
-
 	if msg.Original == "" {
 		logs.Warn.Println("s.etn: empty topic name", s.sid)
 		return "", ErrMalformed(msg.Id, "", msg.Timestamp)
@@ -1238,6 +1315,14 @@ func (s *Session) expandTopicName(msg *ClientComMessage) (string, *ServerComMess
 	return routeTo, nil
 }
 
+func (s *Session) serializeAndUpdateStats(msg *ServerComMessage) interface{} {
+	dataSize, data := s.serialize(msg)
+	if dataSize >= 0 {
+		statsAddHistSample("OutgoingMessageSize", float64(dataSize))
+	}
+	return data
+}
+
 func (s *Session) serialize(msg *ServerComMessage) (int, interface{}) {
 	if s.proto == GRPC {
 		msg := pbServSerialize(msg)
@@ -1245,10 +1330,9 @@ func (s *Session) serialize(msg *ServerComMessage) (int, interface{}) {
 		return -1, msg
 	}
 
-	if s.proto == MULTIPLEX {
-		// No need to serialize the message to bytes within the cluster,
-		// but we have to create a copy because the original msg can be mutated.
-		return -1, msg.copy()
+	if s.isMultiplex() {
+		// No need to serialize the message to bytes within the cluster.
+		return -1, msg
 	}
 
 	out, _ := json.Marshal(msg)

@@ -52,7 +52,7 @@ func listenAndServe(addr string, mux *http.ServeMux, tlfConf *tls.Config, stop <
 			if globals.tlsRedirectHTTP != "" {
 				// Serving redirects from a unix socket or to a unix socket makes no sense.
 				if isUnixAddr(globals.tlsRedirectHTTP) || isUnixAddr(addr) {
-					err = errors.New("HTTP to HTTPS redirect: unix sockets not supported.")
+					err = errors.New("HTTP to HTTPS redirect: unix sockets not supported")
 				} else {
 					logs.Info.Printf("Redirecting connections from HTTP at [%s] to HTTPS at [%s]",
 						globals.tlsRedirectHTTP, addr)
@@ -193,10 +193,13 @@ func (w *errorResponseWriter) WriteHeader(status int) {
 func (w *errorResponseWriter) Write(p []byte) (n int, err error) {
 	if w.status >= http.StatusBadRequest {
 		p, _ = json.Marshal(
-			&ServerComMessage{Ctrl: &MsgServerCtrl{
-				Timestamp: time.Now().UTC().Round(time.Millisecond),
-				Code:      w.status,
-				Text:      http.StatusText(w.status)}})
+			&ServerComMessage{
+				Ctrl: &MsgServerCtrl{
+					Timestamp: time.Now().UTC().Round(time.Millisecond),
+					Code:      w.status,
+					Text:      http.StatusText(w.status),
+				},
+			})
 	}
 	return w.ResponseWriter.Write(p)
 }
@@ -214,10 +217,13 @@ func serve404(wrt http.ResponseWriter, req *http.Request) {
 	wrt.Header().Set("Content-Type", "application/json; charset=utf-8")
 	wrt.WriteHeader(http.StatusNotFound)
 	json.NewEncoder(wrt).Encode(
-		&ServerComMessage{Ctrl: &MsgServerCtrl{
-			Timestamp: time.Now().UTC().Round(time.Millisecond),
-			Code:      http.StatusNotFound,
-			Text:      "not found"}})
+		&ServerComMessage{
+			Ctrl: &MsgServerCtrl{
+				Timestamp: time.Now().UTC().Round(time.Millisecond),
+				Code:      http.StatusNotFound,
+				Text:      "not found",
+			},
+		})
 }
 
 // Redirect HTTP requests to HTTPS
@@ -339,7 +345,7 @@ func authHttpRequest(req *http.Request) (types.Uid, []byte, error) {
 			return uid, nil, types.ErrMalformed
 		}
 
-		if authhdl := store.GetLogicalAuthHandler(authMethod); authhdl != nil {
+		if authhdl := store.Store.GetLogicalAuthHandler(authMethod); authhdl != nil {
 			rec, challenge, err := authhdl.Authenticate(decodedSecret[:n], getRemoteAddr(req))
 			if err != nil {
 				return uid, nil, err

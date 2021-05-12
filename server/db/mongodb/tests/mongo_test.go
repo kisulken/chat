@@ -165,8 +165,7 @@ func TestTopicCreateP2P(t *testing.T) {
 }
 
 func TestTopicShare(t *testing.T) {
-	err := adp.TopicShare(subs)
-	if err != nil {
+	if err := adp.TopicShare(subs); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -224,29 +223,6 @@ func TestUserGetAll(t *testing.T) {
 		if !reflect.DeepEqual(&usr, users[i]) {
 			t.Error(mismatchErrorString("User", &usr, users[i]))
 		}
-	}
-}
-
-func TestUserGetDisabled(t *testing.T) {
-	// Test before deletion date
-	got, err := adp.UserGetDisabled(users[2].DeletedAt.Add(-10 * time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 {
-		t.Fatal(mismatchErrorString("uids length", len(got), 1))
-	}
-	if got[0].String() != users[2].Id {
-		t.Error(mismatchErrorString("userId", got[0].String(), users[2].Id))
-	}
-
-	// Test after deletion date
-	got, err = adp.UserGetDisabled(users[2].DeletedAt.Add(10 * time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != nil {
-		t.Fatal(mismatchErrorString("result", got, nil))
 	}
 }
 
@@ -333,7 +309,7 @@ func TestAuthGetUniqueRecord(t *testing.T) {
 	}
 	if uid != types.ParseUserId("usr"+recs[0].UserId) ||
 		authLvl != recs[0].AuthLvl ||
-		bytes.Compare(secret, recs[0].Secret) != 0 ||
+		!bytes.Equal(secret, recs[0].Secret) ||
 		expires != recs[0].Expires {
 
 		got := fmt.Sprintf("%v %v %v %v", uid, authLvl, secret, expires)
@@ -355,7 +331,7 @@ func TestAuthGetRecord(t *testing.T) {
 	}
 	if recId != recs[0].Id ||
 		authLvl != recs[0].AuthLvl ||
-		bytes.Compare(secret, recs[0].Secret) != 0 ||
+		!bytes.Equal(secret, recs[0].Secret) ||
 		expires != recs[0].Expires {
 
 		got := fmt.Sprintf("%v %v %v %v", recId, authLvl, secret, expires)
@@ -473,11 +449,7 @@ func TestSubscriptionGet(t *testing.T) {
 }
 
 func TestSubsForUser(t *testing.T) {
-	qOpts := types.QueryOpt{
-		Topic: topics[0].Id,
-		Limit: 999,
-	}
-	gotSubs, err := adp.SubsForUser(types.ParseUserId("usr"+users[0].Id), false, &qOpts)
+	gotSubs, err := adp.SubsForUser(types.ParseUserId("usr" + users[0].Id))
 	if err != nil {
 		t.Error(err)
 	}
@@ -486,7 +458,7 @@ func TestSubsForUser(t *testing.T) {
 	}
 
 	// Test not found
-	gotSubs, err = adp.SubsForUser(types.ParseUserId("dummyuserid"), false, nil)
+	gotSubs, err = adp.SubsForUser(types.ParseUserId("dummyuserid"))
 	if err != nil {
 		t.Error(err)
 	}
@@ -518,7 +490,7 @@ func TestSubsForTopic(t *testing.T) {
 }
 
 func TestFindUsers(t *testing.T) {
-	reqTags := []string{"alice", "bob", "carol"}
+	reqTags := [][]string{{"alice", "bob", "carol"}}
 	gotSubs, err := adp.FindUsers(types.ParseUserId("usr"+users[2].Id), reqTags, nil)
 	if err != nil {
 		t.Error(err)
@@ -529,7 +501,7 @@ func TestFindUsers(t *testing.T) {
 }
 
 func TestFindTopics(t *testing.T) {
-	reqTags := []string{"travel", "qwer", "asdf", "zxcv"}
+	reqTags := [][]string{{"travel", "qwer", "asdf", "zxcv"}}
 	gotSubs, err := adp.FindTopics(reqTags, nil)
 	if err != nil {
 		t.Error(err)
@@ -689,7 +661,7 @@ func TestAuthUpdRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got AuthRecord
+	var got authRecord
 	err = db.Collection("auth").FindOne(ctx, b.M{"_id": rec.Id}).Decode(&got)
 	if err != nil {
 		t.Fatal(err)
@@ -988,28 +960,6 @@ func TestAuthDelAllRecords(t *testing.T) {
 	}
 }
 
-func TestSubsDelForTopic(t *testing.T) {
-	// Soft
-	err := adp.SubsDelForTopic(topics[1].Id, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got types.Subscription
-	_ = db.Collection("subscriptions").FindOne(ctx, b.M{"topic": topics[1].Id}).Decode(&got)
-	if got.DeletedAt == nil {
-		t.Errorf(mismatchErrorString("DeletedAt", got.DeletedAt, nil))
-	}
-	// Hard
-	err = adp.SubsDelForTopic(topics[1].Id, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = db.Collection("subscriptions").FindOne(ctx, b.M{"topic": topics[1].Id}).Decode(&got)
-	if err != mdb.ErrNoDocuments {
-		t.Error("Sub not deleted. Err:", err)
-	}
-}
-
 func TestSubsDelForUser(t *testing.T) {
 	// Tested during TestUserDelete (both hard and soft deletions)
 }
@@ -1046,8 +996,8 @@ func TestMessageDeleteList(t *testing.T) {
 		if msg.SeqId == 5 && msg.DeletedFor == nil {
 			t.Error("Message with SeqID=5 should be deleted")
 		}
-		if msg.SeqId == 11 && msg.DeletedFor == nil {
-			t.Error("Message with SeqID=5 should be deleted")
+		if msg.SeqId == 11 && msg.DeletedFor != nil {
+			t.Error("Message with SeqID=11 should not be deleted")
 		}
 	}
 	//
@@ -1108,7 +1058,7 @@ func TestTopicDelete(t *testing.T) {
 		if err = cur.Decode(&got); err != nil {
 			t.Error(err)
 		}
-		if got.DeletedAt == nil {
+		if got.State != types.StateDeleted {
 			t.Error("Soft delete failed:", got)
 		}
 	}
@@ -1151,7 +1101,7 @@ func TestUserDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.DeletedAt == nil {
+	if got.State != types.StateDeleted {
 		t.Error("User soft delete failed", got)
 	}
 
@@ -1222,8 +1172,8 @@ func initConnectionToDb() {
 }
 
 func init() {
-	logs.Init()
-	adp = backend.GetAdapter()
+	logs.Init(os.Stderr, "stdFlags")
+	adp = backend.GetTestAdapter()
 	conffile := flag.String("config", "./test.conf", "config of the database connection")
 
 	if file, err := os.Open(*conffile); err != nil {

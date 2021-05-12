@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tinode/chat/server/logs"
+	"github.com/tinode/chat/server/store"
 )
 
 // A simple implementation of histogram expvar.Var.
@@ -73,6 +74,12 @@ func statsInit(mux *http.ServeMux, path string) {
 	logs.Info.Printf("stats: variables exposed at '%s'", path)
 }
 
+func statsRegisterDbStats() {
+	if f := store.Store.DbStats(); f != nil {
+		expvar.Publish("DbStats", expvar.Func(f))
+	}
+}
+
 // Register integer variable. Don't check for initialization.
 func statsRegisterInt(name string) {
 	expvar.Publish(name, new(expvar.Int))
@@ -84,7 +91,8 @@ func statsRegisterHistogram(name string, bounds []float64) {
 	numBuckets := len(bounds) + 1
 	expvar.Publish(name, &histogram{
 		CountPerBucket: make([]int64, numBuckets),
-		Bounds:         bounds})
+		Bounds:         bounds,
+	})
 }
 
 // Async publish int variable.
@@ -126,7 +134,6 @@ func statsShutdown() {
 
 // The go routine which actually publishes stats updates.
 func statsUpdater() {
-
 	for upd := range globals.statsUpdate {
 		if upd == nil {
 			globals.statsUpdate = nil
